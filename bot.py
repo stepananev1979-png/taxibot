@@ -28,6 +28,8 @@ active_chats = {}       # user_id -> order_id
 driver_profiles = {}    # driver_id -> {name, car, plate}
 driver_ratings = {}     # driver_id -> [list of ratings]
 client_history = {}     # client_id -> [list of orders]
+drivers_on_shift = set()  # множество ID водителей на смене
+all_drivers = {}          # driver_id -> имя (все кто писал боту)
 
 
 # ─── СОСТОЯНИЯ ───────────────────────────────
@@ -78,7 +80,6 @@ async def notify_no_driver(order_id: int):
     if order["status"] != "new":
         return
 
-    # Уведомляем клиента
     await bot.send_message(
         order["client_id"],
         "⚠️ *Пока никто не взял ваш заказ.*\n\n"
@@ -88,8 +89,6 @@ async def notify_no_driver(order_id: int):
         "Приносим извинения за ожидание! 🙏",
         parse_mode="Markdown"
     )
-
-    # Уведомляем администратора
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
@@ -104,7 +103,7 @@ async def notify_no_driver(order_id: int):
             pass
 
 
-# ─── /start ───────────────────────────────────
+# ─── /start — для клиентов ───────────────────
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -117,6 +116,148 @@ async def cmd_start(message: types.Message, state: FSMContext):
         parse_mode="Markdown"
     )
     await state.set_state(ClientStates.waiting_from)
+
+
+# ─── /driver — для водителей ─────────────────
+
+@dp.message(Command("driver"))
+async def cmd_driver(message: types.Message, state: FSMContext):
+    if message.chat.id == DRIVERS_CHAT_ID:
+        return
+    await state.clear()
+
+    user_id = message.from_user.id
+    name = message.from_user.first_name or f"ID:{user_id}"
+
+    # Добавляем в список водителей
+    all_drivers[user_id] = name
+
+    await message.answer(
+        "🚗 *Вы зарегистрированы как водитель!*\n\n"
+        "Диспетчер поставит вас на смену.\n"
+        "После этого вы сможете брать заказы.\n\n"
+        "Заполните профиль: /profile",
+        parse_mode="Markdown"
+    )
+
+    # Уведомляем админа
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🚗 *Новый водитель написал боту:*\n\n"
+                f"Имя: {name}\n"
+                f"ID: `{user_id}`\n\n"
+                f"Поставить на смену:\n"
+                f"`/on {user_id}`",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
+
+
+# ─── КОМАНДЫ СМЕН (только для админа) ────────
+
+@dp.message(Command("on"))
+async def shift_on(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ У вас нет доступа.")
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer(
+            "⚠️ Укажите ID водителя.\n"
+            "Пример: `/on 123456789`\n\n"
+            "Список водителей: /drivers",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        driver_id = int(parts[1])
+    except ValueError:
+        await message.answer("⚠️ ID должен быть числом.")
+        return
+
+    drivers_on_shift.add(driver_id)
+    name = all_drivers.get(driver_id, f"ID:{driver_id}")
+
+    await message.answer(f"✅ Водитель *{name}* поставлен на смену!", parse_mode="Markdown")
+
+    try:
+        await bot.send_message(
+            driver_id,
+            "✅ *Вы поставлены на смену!*\n\n"
+            "Теперь вы можете брать заказы.\n"
+            "Следите за чатом водителей.",
+            parse_mode="Markdown"
+        )
+    except:
+        await message.answer("⚠️ Не удалось уведомить водителя — он не писал боту.")
+
+
+@dp.message(Command("off"))
+async def shift_off(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ У вас нет доступа.")
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer(
+            "⚠️ Укажите ID водителя.\n"
+            "Пример: `/off 123456789`\n\n"
+            "Список водителей: /drivers",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        driver_id = int(parts[1])
+    except ValueError:
+        await message.answer("⚠️ ID должен быть числом.")
+        return
+
+    drivers_on_shift.discard(driver_id)
+    name = all_drivers.get(driver_id, f"ID:{driver_id}")
+
+    await message.answer(f"🔴 Водитель *{name}* снят со смены!", parse_mode="Markdown")
+
+    try:
+        await bot.send_message(
+            driver_id,
+            "🔴 *Ваша смена завершена.*\n\n"
+            "Вы больше не можете брать заказы.\n"
+            "До следующей смены!",
+            parse_mode="Markdown"
+        )
+    except:
+        pass
+
+
+@dp.message(Command("drivers"))
+async def list_drivers(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ У вас нет доступа.")
+        return
+
+    if not all_drivers:
+        await message.answer("👤 Пока никто не писал боту.")
+        return
+
+    text = "👨‍💼 *Список водителей:*\n\n"
+    for driver_id, name in all_drivers.items():
+        status = "🟢 на смене" if driver_id in drivers_on_shift else "🔴 не на смене"
+        profile = driver_profiles.get(driver_id, {})
+        car_info = f" | 🚗 {profile['car']}" if profile.get("car") else ""
+        ratings = driver_ratings.get(driver_id, [])
+        rating_info = f" | ⭐{sum(ratings)/len(ratings):.1f}" if ratings else ""
+        text += f"👤 *{name}*{car_info}{rating_info}\n"
+        text += f"   ID: `{driver_id}` — {status}\n"
+        text += f"   /on {driver_id} | /off {driver_id}\n\n"
+
+    await message.answer(text, parse_mode="Markdown")
 
 
 # ─── /history — история заказов клиента ──────
@@ -200,7 +341,7 @@ async def cmd_stats(message: types.Message):
     done = sum(1 for o in orders.values() if o["status"] == "done")
     active = sum(1 for o in orders.values() if o["status"] == "active")
     new = sum(1 for o in orders.values() if o["status"] == "new")
-    drivers_count = len(driver_profiles)
+    on_shift = len(drivers_on_shift)
 
     ratings_text = ""
     for did, ratings in driver_ratings.items():
@@ -215,8 +356,9 @@ async def cmd_stats(message: types.Message):
         f"✅ Завершено: {done}\n"
         f"🚖 В процессе: {active}\n"
         f"🆕 Новых: {new}\n\n"
-        f"👨‍💼 Водителей с профилем: {drivers_count}\n\n"
-        f"⭐ Рейтинги водителей:\n{ratings_text or '  Нет данных'}",
+        f"🟢 Водителей на смене: {on_shift}\n"
+        f"👨‍💼 Всего водителей: {len(all_drivers)}\n\n"
+        f"⭐ Рейтинги:\n{ratings_text or '  Нет данных'}",
         parse_mode="Markdown"
     )
 
@@ -272,7 +414,6 @@ async def get_to_address(message: types.Message, state: FSMContext):
         reply_markup=keyboard
     )
 
-    # Запускаем таймер 5 минут
     asyncio.create_task(notify_no_driver(order_id))
 
 
@@ -281,6 +422,15 @@ async def get_to_address(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("take_"))
 async def take_order(callback: types.CallbackQuery):
     order_id = int(callback.data.split("_")[1])
+    driver_id = callback.from_user.id
+
+    # Проверка смены
+    if driver_id not in drivers_on_shift:
+        await callback.answer(
+            "⛔ Вы не на смене!\nОбратитесь к диспетчеру.",
+            show_alert=True
+        )
+        return
 
     if order_id not in orders:
         await callback.answer("Заказ не найден!", show_alert=True)
@@ -292,10 +442,10 @@ async def take_order(callback: types.CallbackQuery):
         return
 
     order["status"] = "active"
-    order["driver_id"] = callback.from_user.id
-    active_chats[callback.from_user.id] = order_id
+    order["driver_id"] = driver_id
+    active_chats[driver_id] = order_id
 
-    profile = driver_profiles.get(callback.from_user.id, {})
+    profile = driver_profiles.get(driver_id, {})
     driver_name = profile.get("name") or callback.from_user.first_name or "Водитель"
     car_info = f"\n🚗 {profile['car']} | 🔢 {profile['plate']}" if profile else ""
 
@@ -309,7 +459,7 @@ async def take_order(callback: types.CallbackQuery):
     await callback.answer("Вы взяли заказ!")
 
     await bot.send_message(
-        callback.from_user.id,
+        driver_id,
         f"✅ *Вы взяли заказ #{order_id}*\n\n"
         f"📍 Откуда: {order['from_addr']}\n"
         f"🏁 Куда: {order['to_addr']}\n\n"
@@ -369,8 +519,7 @@ async def set_price(message: types.Message, state: FSMContext):
     await bot.send_message(
         order["client_id"],
         f"💰 *Водитель назначил цену поездки:*\n\n"
-        f"*{price} руб.*\n\n"
-        f"Если согласны — просто ожидайте водителя.",
+        f"*{price} руб.*",
         parse_mode="Markdown"
     )
 
@@ -499,7 +648,6 @@ async def rate_driver(callback: types.CallbackQuery):
     avg = sum(driver_ratings[driver_id]) / len(driver_ratings[driver_id])
     stars = "⭐" * rating
 
-    # Сохраняем в историю клиента
     client_id = order["client_id"]
     if client_id not in client_history:
         client_history[client_id] = []
@@ -514,7 +662,7 @@ async def rate_driver(callback: types.CallbackQuery):
 
     await callback.message.edit_text(
         f"Спасибо за оценку! {stars}\n\n"
-        f"Для новой поездки напишите /start\n"
+        f"Для новой поездки — /start\n"
         f"История поездок — /history"
     )
     await callback.answer("Оценка сохранена!")
