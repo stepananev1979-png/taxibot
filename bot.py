@@ -7,6 +7,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import os
+from datetime import datetime
 
 # Настройки
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8619478031:AAGf1mmtJQgtEGJ9m05hDW16ok7eDD-qijQ")
@@ -23,9 +24,10 @@ dp = Dispatcher(storage=storage)
 # Хранилища
 orders = {}
 order_counter = 0
-active_chats = {}      # user_id -> order_id
-driver_profiles = {}   # driver_id -> {name, car, plate}
-driver_ratings = {}    # driver_id -> [list of ratings]
+active_chats = {}       # user_id -> order_id
+driver_profiles = {}    # driver_id -> {name, car, plate}
+driver_ratings = {}     # driver_id -> [list of ratings]
+client_history = {}     # client_id -> [list of orders]
 
 
 # ─── СОСТОЯНИЯ ───────────────────────────────
@@ -40,13 +42,18 @@ class DriverStates(StatesGroup):
     waiting_plate = State()
 
 
-# ─── УТИЛИТЫ ─────────────────────────────────
+# ─── КЛАВИАТУРЫ ──────────────────────────────
 
 def driver_keyboard(order_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💰 Назначить цену", callback_data=f"price_{order_id}")],
         [InlineKeyboardButton(text="📍 Отправить геолокацию клиенту", callback_data=f"geo_{order_id}")],
         [InlineKeyboardButton(text="🏁 Завершить заказ", callback_data=f"done_{order_id}")]
+    ])
+
+def client_active_keyboard(order_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📍 Отправить мою геолокацию водителю", callback_data=f"cgeo_{order_id}")]
     ])
 
 def stars_keyboard(order_id):
@@ -61,7 +68,43 @@ def stars_keyboard(order_id):
     ])
 
 
-# ─── КОМАНДА /start ───────────────────────────
+# ─── УВЕДОМЛЕНИЕ ЕСЛИ ЗАКАЗ НЕ ВЗЯЛИ ────────
+
+async def notify_no_driver(order_id: int):
+    await asyncio.sleep(300)  # 5 минут
+    if order_id not in orders:
+        return
+    order = orders[order_id]
+    if order["status"] != "new":
+        return
+
+    # Уведомляем клиента
+    await bot.send_message(
+        order["client_id"],
+        "⚠️ *Пока никто не взял ваш заказ.*\n\n"
+        "Попробуйте:\n"
+        "— подождать ещё немного\n"
+        "— написать /start и сделать новый заказ\n\n"
+        "Приносим извинения за ожидание! 🙏",
+        parse_mode="Markdown"
+    )
+
+    # Уведомляем администратора
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"⚠️ *Заказ #{order_id} никто не взял 5 минут!*\n\n"
+                f"📍 Откуда: {order['from_addr']}\n"
+                f"🏁 Куда: {order['to_addr']}\n\n"
+                f"Требуется внимание!",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
+
+
+# ─── /start ───────────────────────────────────
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -76,7 +119,38 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await state.set_state(ClientStates.waiting_from)
 
 
-# ─── КОМАНДА /profile — профиль водителя ─────
+# ─── /history — история заказов клиента ──────
+
+@dp.message(Command("history"))
+async def cmd_history(message: types.Message):
+    if message.chat.id == DRIVERS_CHAT_ID:
+        return
+
+    client_id = message.from_user.id
+    history = client_history.get(client_id, [])
+
+    if not history:
+        await message.answer(
+            "📋 У вас пока нет завершённых поездок.\n\n"
+            "Напишите /start чтобы заказать такси!"
+        )
+        return
+
+    text = "📋 *Ваши последние поездки:*\n\n"
+    for i, ride in enumerate(reversed(history[-10:]), 1):
+        price_text = f"💰 {ride['price']} руб." if ride.get("price") else "💰 цена не указана"
+        rating_text = f"⭐ {ride['rating']}/5" if ride.get("rating") else "⭐ без оценки"
+        text += (
+            f"*{i}. Заказ #{ride['order_id']}*\n"
+            f"📍 {ride['from_addr']} → {ride['to_addr']}\n"
+            f"{price_text} | {rating_text}\n"
+            f"🕐 {ride['date']}\n\n"
+        )
+
+    await message.answer(text, parse_mode="Markdown")
+
+
+# ─── /profile — профиль водителя ─────────────
 
 @dp.message(Command("profile"))
 async def cmd_profile(message: types.Message, state: FSMContext):
@@ -114,7 +188,7 @@ async def get_plate(message: types.Message, state: FSMContext):
     )
 
 
-# ─── КОМАНДА /stats — админ статистика ───────
+# ─── /stats — статистика админа ──────────────
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message):
@@ -126,7 +200,6 @@ async def cmd_stats(message: types.Message):
     done = sum(1 for o in orders.values() if o["status"] == "done")
     active = sum(1 for o in orders.values() if o["status"] == "active")
     new = sum(1 for o in orders.values() if o["status"] == "new")
-
     drivers_count = len(driver_profiles)
 
     ratings_text = ""
@@ -172,7 +245,8 @@ async def get_to_address(message: types.Message, state: FSMContext):
         "to_addr": to_addr,
         "driver_id": None,
         "status": "new",
-        "price": None
+        "price": None,
+        "date": datetime.now().strftime("%d.%m.%Y %H:%M")
     }
     active_chats[message.from_user.id] = order_id
     await state.clear()
@@ -197,6 +271,9 @@ async def get_to_address(message: types.Message, state: FSMContext):
         parse_mode="Markdown",
         reply_markup=keyboard
     )
+
+    # Запускаем таймер 5 минут
+    asyncio.create_task(notify_no_driver(order_id))
 
 
 # ─── ВОДИТЕЛЬ БЕРЁТ ЗАКАЗ ────────────────────
@@ -245,8 +322,9 @@ async def take_order(callback: types.CallbackQuery):
         order["client_id"],
         f"🎉 *Водитель найден!*\n\n"
         f"👤 Водитель: {driver_name}{car_info}\n\n"
-        f"Вы можете написать водителю прямо здесь.",
-        parse_mode="Markdown"
+        f"Вы можете написать водителю или отправить геолокацию.",
+        parse_mode="Markdown",
+        reply_markup=client_active_keyboard(order_id)
     )
 
 
@@ -297,7 +375,7 @@ async def set_price(message: types.Message, state: FSMContext):
     )
 
 
-# ─── ГЕОЛОКАЦИЯ ──────────────────────────────
+# ─── ГЕОЛОКАЦИЯ ВОДИТЕЛЯ → КЛИЕНТУ ──────────
 
 @dp.callback_query(F.data.startswith("geo_"))
 async def send_geo_request(callback: types.CallbackQuery):
@@ -306,6 +384,19 @@ async def send_geo_request(callback: types.CallbackQuery):
         callback.from_user.id,
         "📍 Нажмите на скрепку 📎 внизу → выберите *Геолокация* → отправьте своё местоположение.\n\n"
         "Клиент сразу получит вашу геолокацию на карте!",
+        parse_mode="Markdown"
+    )
+
+
+# ─── ГЕОЛОКАЦИЯ КЛИЕНТА → ВОДИТЕЛЮ ──────────
+
+@dp.callback_query(F.data.startswith("cgeo_"))
+async def client_geo_request(callback: types.CallbackQuery):
+    await callback.answer()
+    await bot.send_message(
+        callback.from_user.id,
+        "📍 Нажмите на скрепку 📎 внизу → выберите *Геолокация* → отправьте своё местоположение.\n\n"
+        "Водитель получит вашу геолокацию на карте!",
         parse_mode="Markdown"
     )
 
@@ -320,7 +411,10 @@ async def relay_message(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
 
     if user_id not in active_chats:
-        await message.answer("Напишите /start чтобы заказать такси.")
+        await message.answer(
+            "Напишите /start чтобы заказать такси.\n"
+            "Напишите /history чтобы посмотреть историю поездок."
+        )
         return
 
     order_id = active_chats[user_id]
@@ -405,8 +499,23 @@ async def rate_driver(callback: types.CallbackQuery):
     avg = sum(driver_ratings[driver_id]) / len(driver_ratings[driver_id])
     stars = "⭐" * rating
 
+    # Сохраняем в историю клиента
+    client_id = order["client_id"]
+    if client_id not in client_history:
+        client_history[client_id] = []
+    client_history[client_id].append({
+        "order_id": order_id,
+        "from_addr": order["from_addr"],
+        "to_addr": order["to_addr"],
+        "price": order.get("price"),
+        "rating": rating,
+        "date": order.get("date", "—")
+    })
+
     await callback.message.edit_text(
-        f"Спасибо за оценку! {stars}\n\nДля нового заказа напишите /start"
+        f"Спасибо за оценку! {stars}\n\n"
+        f"Для новой поездки напишите /start\n"
+        f"История поездок — /history"
     )
     await callback.answer("Оценка сохранена!")
 
