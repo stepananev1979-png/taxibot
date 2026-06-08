@@ -8,11 +8,85 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import os
 from datetime import datetime
+from openpyxl import load_workbook
 
 # Настройки
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8619478031:AAGf1mmtJQgtEGJ9m05hDW16ok7eDD-qijQ")
 DRIVERS_CHAT_ID = int(os.getenv("DRIVERS_CHAT_ID", "-1003935717475"))
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "8557230844").split(",")]
+
+# ─── ЗАГРУЗКА ПРАЙСА ─────────────────────────
+
+def load_price_table():
+    prices = {}
+    try:
+        wb = load_workbook("price.xlsx", read_only=True)
+        ws = wb.active
+        skip = 3  # пропускаем заголовок, ночной тариф, названия колонок
+        for i, row in enumerate(ws.iter_rows(values_only=True)):
+            if i < skip:
+                continue
+            if row[0] and row[2] and row[4]:
+                from_street = str(row[0]).strip().lower()
+                to_street = str(row[2]).strip().lower()
+                price_day = int(row[4]) if row[4] else 150
+                price_night = int(row[5]) if row[5] else price_day + 50
+                prices[(from_street, to_street)] = (price_day, price_night)
+        print(f"Загружено маршрутов: {len(prices)}")
+    except Exception as e:
+        print(f"Ошибка загрузки прайса: {e}")
+    return prices
+
+PRICE_TABLE = load_price_table()
+print(f"Загружено маршрутов: {len(PRICE_TABLE)}")
+
+
+def get_price(from_addr: str, to_addr: str) -> str:
+    from datetime import datetime as dt
+    now = dt.now()
+    is_night = now.hour < 6 or (now.hour == 6 and now.minute < 30)
+
+    # Нормализуем — убираем номера домов, лишние слова
+    def normalize(addr):
+        addr = addr.lower().strip()
+        # убираем номер дома
+        import re
+        addr = re.sub(r'\s+\d+[а-яa-z]?$', '', addr)
+        addr = re.sub(r',.*', '', addr)
+        addr = addr.strip()
+        return addr
+
+    from_norm = normalize(from_addr)
+    to_norm = normalize(to_addr)
+
+    # Ищем точное совпадение
+    key = (from_norm, to_norm)
+    if key in PRICE_TABLE:
+        day, night = PRICE_TABLE[key]
+        price = night if is_night else day
+        night_note = " (ночной тариф 🌙)" if is_night else ""
+        return (
+            f"💰 *Предварительная стоимость поездки: {price} руб.*{night_note}\n"
+            f"_Точную стоимость укажет водитель._"
+        )
+
+    # Ищем частичное совпадение
+    for (f, t), (day, night) in PRICE_TABLE.items():
+        if from_norm in f or f in from_norm:
+            if to_norm in t or t in to_norm:
+                price = night if is_night else day
+                night_note = " (ночной тариф 🌙)" if is_night else ""
+                return (
+                    f"💰 *Предварительная стоимость поездки: {price} руб.*{night_note}\n"
+                    f"_Точную стоимость укажет водитель._"
+                )
+
+    # Не нашли
+    return (
+        f"💰 *Предварительная стоимость поездки: от 150 руб.*\n"
+        f"_Точную стоимость укажет водитель._"
+    )
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -393,10 +467,13 @@ async def get_to_address(message: types.Message, state: FSMContext):
     active_chats[message.from_user.id] = order_id
     await state.clear()
 
+    price_text = get_price(from_addr, to_addr)
+
     await message.answer(
         f"✅ *Ваш заказ принят!*\n\n"
         f"📍 Откуда: {from_addr}\n"
         f"🏁 Куда: {to_addr}\n\n"
+        f"{price_text}\n\n"
         f"⏳ Ищем водителя, ожидайте...",
         parse_mode="Markdown"
     )
