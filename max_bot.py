@@ -18,7 +18,7 @@ TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 # Логируем что загрузилось
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logger.info(f"MAX_TOKEN: '{MAX_TOKEN[:15]}...' (длина: {len(MAX_TOKEN)})")
+logger.info(f"ТОКЕН ДЛИНА: {len(MAX_TOKEN)} НАЧАЛО: {MAX_TOKEN[:20]}")
 logger.info(f"BOT_TOKEN: '{TG_BOT_TOKEN[:10]}...'")
 logger.info(f"DRIVERS_CHAT_ID: {DRIVERS_CHAT_ID}")
 
