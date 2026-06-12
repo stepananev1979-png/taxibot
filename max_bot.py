@@ -83,11 +83,11 @@ def get_price(from_addr, to_addr):
 
 # ─── ОТПРАВКА В МАКС ─────────────────────────
 
-async def send_max(session, user_id, text):
+async def send_max(session, chat_id, text):
     url = f"{MAX_API}/messages"
-    headers = {"Authorization": f"Bearer {MAX_TOKEN}"}
+    headers = {"Authorization": MAX_TOKEN}
     payload = {
-        "recipient": {"user_id": int(user_id)},
+        "recipient": {"chat_id": int(chat_id)},
         "body": {"text": text}
     }
     try:
@@ -115,13 +115,13 @@ async def send_tg(session, chat_id, text, keyboard=None):
 
 # ─── УВЕДОМЛЕНИЕ 5 МИНУТ ─────────────────────
 
-async def notify_no_driver(session, order_id, user_id):
+async def notify_no_driver(session, order_id, client_chat_id):
     await asyncio.sleep(300)
     if order_id not in max_orders:
         return
     if max_orders[order_id]["status"] != "new":
         return
-    await send_max(session, user_id,
+    await send_max(session, client_chat_id,
         "⚠️ Пока никто не взял ваш заказ.\n\n"
         "Напишите /start чтобы попробовать снова.\n"
         "Приносим извинения! 🙏"
@@ -144,22 +144,29 @@ async def handle_update(session, update):
     else:
         return
 
+    logger.info(f"ПОЛНЫЙ UPDATE: {update}")
+
     sender = message.get("sender", {})
     user_id = sender.get("user_id")
+
+    # В MAX API личные сообщения нужно отправлять с chat_id, не user_id
+    recipient = message.get("recipient", {})
+    chat_id = recipient.get("chat_id") or recipient.get("user_id") or user_id
+
     body = message.get("body", {})
     text = body.get("text", "").strip() if body else ""
 
     if not user_id:
         return
 
-    logger.info(f"Сообщение от {user_id}: {text}")
+    logger.info(f"Сообщение от user_id={user_id}, chat_id={chat_id}: {text}")
 
     state = max_states.get(user_id, {})
 
     # /start или bot_started
     if text.lower() in ["/start", "start", "привет"] or update_type == "bot_started":
-        max_states[user_id] = {"step": "waiting_from"}
-        await send_max(session, user_id,
+        max_states[user_id] = {"step": "waiting_from", "chat_id": chat_id}
+        await send_max(session, chat_id,
             "🚕 Добро пожаловать в службу такси!\n\n"
             "Введите адрес ОТКУДА вас забрать:"
         )
@@ -167,8 +174,8 @@ async def handle_update(session, update):
 
     # Шаг 1 — откуда
     if state.get("step") == "waiting_from":
-        max_states[user_id] = {"step": "waiting_to", "from": text}
-        await send_max(session, user_id,
+        max_states[user_id] = {"step": "waiting_to", "from": text, "chat_id": chat_id}
+        await send_max(session, chat_id,
             f"📍 Откуда: {text}\n\n"
             f"Теперь введите адрес КУДА вас везти:"
         )
@@ -184,17 +191,18 @@ async def handle_update(session, update):
 
         max_orders[order_id] = {
             "client_id": user_id,
+            "client_chat_id": chat_id,
             "from_addr": from_addr,
             "to_addr": to_addr,
             "driver_tg_id": None,
             "status": "new",
             "date": datetime.now().strftime("%d.%m.%Y %H:%M")
         }
-        max_states[user_id] = {"step": "active", "order_id": order_id}
+        max_states[user_id] = {"step": "active", "order_id": order_id, "chat_id": chat_id}
 
         price_text = get_price(from_addr, to_addr)
 
-        await send_max(session, user_id,
+        await send_max(session, chat_id,
             f"✅ Ваш заказ принят!\n\n"
             f"📍 Откуда: {from_addr}\n"
             f"🏁 Куда: {to_addr}\n\n"
@@ -215,12 +223,13 @@ async def handle_update(session, update):
             keyboard=keyboard
         )
 
-        asyncio.create_task(notify_no_driver(session, order_id, user_id))
+        asyncio.create_task(notify_no_driver(session, order_id, chat_id))
         return
 
     # Переписка клиента с водителем
     if state.get("step") == "active":
         order_id = state.get("order_id")
+        active_chat_id = state.get("chat_id", chat_id)
         if order_id and order_id in max_orders:
             order = max_orders[order_id]
             if order.get("driver_tg_id"):
@@ -228,11 +237,11 @@ async def handle_update(session, update):
                     f"💬 *Сообщение от клиента (MAX):*\n{text}"
                 )
             else:
-                await send_max(session, user_id, "⏳ Ожидайте, водитель ещё не найден...")
+                await send_max(session, active_chat_id, "⏳ Ожидайте, водитель ещё не найден...")
         return
 
     # Если ничего не подошло
-    await send_max(session, user_id,
+    await send_max(session, chat_id,
         "Напишите /start чтобы заказать такси 🚕"
     )
 
@@ -267,7 +276,7 @@ async def polling():
             except Exception as e:
                 logger.error(f"Ошибка: {e}")
 
-        headers = {"Authorization": f"Bearer {token}"}
+        headers = {"Authorization": token}
 
         while True:
             try:
