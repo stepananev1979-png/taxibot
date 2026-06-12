@@ -77,13 +77,13 @@ def get_price(from_addr, to_addr):
 
 async def send_max(session, user_id, text):
     url = f"{MAX_API}/messages"
-    params = {"access_token": MAX_TOKEN}
+    headers = {"Authorization": f"Bearer {MAX_TOKEN}"}
     payload = {
         "recipient": {"user_id": user_id},
         "body": {"text": text}
     }
     try:
-        async with session.post(url, params=params, json=payload) as r:
+        async with session.post(url, headers=headers, json=payload) as r:
             result = await r.json()
             logger.info(f"MAX send: {result}")
             return result
@@ -233,14 +233,14 @@ async def handle_update(session, update):
 
 async def polling():
     global max_marker
-    params_base = {"access_token": MAX_TOKEN}
+    headers = {"Authorization": f"Bearer {MAX_TOKEN}"}
 
     async with aiohttp.ClientSession() as session:
         logger.info("MAX бот запущен! Начинаем polling...")
 
         # Проверяем подключение
         try:
-            async with session.get(f"{MAX_API}/me", params=params_base) as r:
+            async with session.get(f"{MAX_API}/me", headers=headers) as r:
                 me = await r.json()
                 logger.info(f"Бот подключён: {me}")
         except Exception as e:
@@ -248,12 +248,13 @@ async def polling():
 
         while True:
             try:
-                params = {**params_base, "timeout": 20, "limit": 100}
+                params = {"timeout": 20, "limit": 100}
                 if max_marker:
                     params["marker"] = max_marker
 
                 async with session.get(
                     f"{MAX_API}/updates",
+                    headers=headers,
                     params=params,
                     timeout=aiohttp.ClientTimeout(total=30)
                 ) as r:
