@@ -120,7 +120,7 @@ async def notify_no_driver(session, order_id, client_user_id):
         return
     if max_orders[order_id]["status"] != "new":
         return
-    await send_max(session, user_id,
+    await send_max(session, client_user_id,
         "⚠️ Пока никто не взял ваш заказ.\n\n"
         "Напишите /start чтобы попробовать снова.\n"
         "Приносим извинения! 🙏"
@@ -215,12 +215,14 @@ async def handle_update(session, update):
                 {"text": "✅ Взять заказ (MAX)", "callback_data": f"takemax_{order_id}"}
             ]]
         }
-        await send_tg(session, DRIVERS_CHAT_ID,
+        logger.info(f"Отправляем заказ {order_id} в TG чат {DRIVERS_CHAT_ID}")
+        tg_result = await send_tg(session, DRIVERS_CHAT_ID,
             f"🚖 *НОВЫЙ ЗАКАЗ {order_id}* (из Макса 📱)\n\n"
             f"📍 Откуда: {from_addr}\n"
             f"🏁 Куда: {to_addr}\n",
             keyboard=keyboard
         )
+        logger.info(f"TG send result: {tg_result}")
 
         asyncio.create_task(notify_no_driver(session, order_id, user_id))
         return
