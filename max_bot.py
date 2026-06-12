@@ -18,7 +18,7 @@ TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 # Логируем что загрузилось
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logger.info(f"ТОКЕН ДЛИНА: {len(MAX_TOKEN)} НАЧАЛО: {MAX_TOKEN[:20]}")
+logger.info(f"MAX_TOKEN: '{MAX_TOKEN[:15]}...' (длина: {len(MAX_TOKEN)})")
 logger.info(f"BOT_TOKEN: '{TG_BOT_TOKEN[:10]}...'")
 logger.info(f"DRIVERS_CHAT_ID: {DRIVERS_CHAT_ID}")
 
@@ -87,7 +87,7 @@ async def send_max(session, user_id, text):
     url = f"{MAX_API}/messages"
     headers = {"Authorization": MAX_TOKEN}
     payload = {
-        "recipient": {"user_id": user_id},
+        "recipient": {"user_id": int(user_id)},
         "body": {"text": text}
     }
     try:
