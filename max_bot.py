@@ -85,7 +85,7 @@ def get_price(from_addr, to_addr):
 
 async def send_max(session, user_id, text):
     url = f"{MAX_API}/messages"
-    headers = {"Authorization": MAX_TOKEN}
+    headers = {"Authorization": f"Bearer {MAX_TOKEN}"}
     payload = {
         "recipient": {"user_id": int(user_id)},
         "body": {"text": text}
@@ -267,7 +267,7 @@ async def polling():
             except Exception as e:
                 logger.error(f"Ошибка: {e}")
 
-        headers = {"Authorization": token}
+        headers = {"Authorization": f"Bearer {token}"}
 
         while True:
             try:
