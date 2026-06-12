@@ -3,52 +3,101 @@ import logging
 import os
 import aiohttp
 from datetime import datetime
+from openpyxl import load_workbook
+import re
 
 # Настройки
 MAX_TOKEN = os.getenv("MAX_TOKEN", "f9LHodD0cOIaJNGoUYKSYuCQvJBYTkPKvf-Apng6RHg-XRcfRq78dAdalAzv2A0LlofhyQSq3OcESloHr9O_")
 TG_BOT_TOKEN = os.getenv("BOT_TOKEN", "8619478031:AAGf1mmtJQgtEGJ9m05hDW16ok7eDD-qijQ")
 DRIVERS_CHAT_ID = int(os.getenv("DRIVERS_CHAT_ID", "-1003935717475"))
 
-MAX_API = "https://botapi.max.ru"
+MAX_API = "https://platform-api.max.ru"
 TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Хранилища
-max_orders = {}        # order_id -> данные заказа
+max_orders = {}
 max_order_counter = 0
-max_active_chats = {}  # user_id -> order_id
-max_marker = 0         # маркер для получения новых сообщений
+max_states = {}   # user_id -> {"step": ..., "from": ..., "order_id": ...}
+max_marker = 0
+
+# Загружаем прайс
+PRICE_TABLE = {}
+def load_prices():
+    global PRICE_TABLE
+    try:
+        wb = load_workbook("price.xlsx", read_only=True)
+        ws = wb.active
+        for i, row in enumerate(ws.iter_rows(values_only=True)):
+            if i < 3:
+                continue
+            if row[0] and row[2] and row[4]:
+                f = str(row[0]).strip().lower()
+                t = str(row[2]).strip().lower()
+                PRICE_TABLE[(f, t)] = (int(row[4]), int(row[5]) if row[5] else int(row[4]) + 50)
+        logger.info(f"Загружено маршрутов: {len(PRICE_TABLE)}")
+    except Exception as e:
+        logger.error(f"Ошибка загрузки прайса: {e}")
+
+load_prices()
+
+
+def normalize(addr):
+    addr = addr.lower().strip()
+    addr = re.sub(r'\s+\d+[а-яa-z]?$', '', addr)
+    addr = re.sub(r',.*', '', addr)
+    addr = re.sub(r'^(ул\.|улица|пер\.|переулок)\s+', '', addr)
+    return addr.strip()
+
+
+def get_price(from_addr, to_addr):
+    fn = normalize(from_addr)
+    tn = normalize(to_addr)
+    now = datetime.now()
+    is_night = now.hour < 6 or (now.hour == 6 and now.minute < 30)
+
+    if (fn, tn) in PRICE_TABLE:
+        d, n = PRICE_TABLE[(fn, tn)]
+        price = n if is_night else d
+        night = " (ночной тариф 🌙)" if is_night else ""
+        return f"💰 Предварительная стоимость: {price} руб.{night}\nТочную стоимость укажет водитель."
+
+    for (f, t), (d, n) in PRICE_TABLE.items():
+        if (fn in f or f in fn) and (tn in t or t in tn):
+            price = n if is_night else d
+            night = " (ночной тариф 🌙)" if is_night else ""
+            return f"💰 Предварительная стоимость: {price} руб.{night}\nТочную стоимость укажет водитель."
+
+    return "💰 Предварительная стоимость: от 150 руб.\nТочную стоимость укажет водитель."
 
 
 # ─── ОТПРАВКА В МАКС ─────────────────────────
 
-async def send_max_message(session, user_id, text):
+async def send_max(session, user_id, text):
     url = f"{MAX_API}/messages"
-    headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
+    params = {"access_token": MAX_TOKEN}
     payload = {
         "recipient": {"user_id": user_id},
         "body": {"text": text}
     }
     try:
-        async with session.post(url, json=payload, headers=headers) as r:
-            return await r.json()
+        async with session.post(url, params=params, json=payload) as r:
+            result = await r.json()
+            logger.info(f"MAX send: {result}")
+            return result
     except Exception as e:
         logger.error(f"Ошибка отправки в Макс: {e}")
 
 
 # ─── ОТПРАВКА В TELEGRAM ──────────────────────
 
-async def send_tg_message(session, chat_id, text, reply_markup=None):
+async def send_tg(session, chat_id, text, keyboard=None):
     url = f"{TG_API}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if keyboard:
+        payload["reply_markup"] = keyboard
     try:
         async with session.post(url, json=payload) as r:
             return await r.json()
@@ -56,106 +105,88 @@ async def send_tg_message(session, chat_id, text, reply_markup=None):
         logger.error(f"Ошибка отправки в Telegram: {e}")
 
 
-# ─── ПОЛУЧЕНИЕ ЦЕНЫ ──────────────────────────
+# ─── УВЕДОМЛЕНИЕ 5 МИНУТ ─────────────────────
 
-def get_price_max(from_addr, to_addr):
-    try:
-        from openpyxl import load_workbook
-        import re
-
-        def normalize(addr):
-            addr = addr.lower().strip()
-            addr = re.sub(r'\s+\d+[а-яa-z]?$', '', addr)
-            addr = re.sub(r',.*', '', addr)
-            addr = re.sub(r'^(ул\.|улица|пер\.|переулок)\s+', '', addr)
-            return addr.strip()
-
-        wb = load_workbook("price.xlsx", read_only=True)
-        ws = wb.active
-        prices = {}
-        for i, row in enumerate(ws.iter_rows(values_only=True)):
-            if i < 3:
-                continue
-            if row[0] and row[2] and row[4]:
-                f = str(row[0]).strip().lower()
-                t = str(row[2]).strip().lower()
-                prices[(f, t)] = (int(row[4]), int(row[5]) if row[5] else int(row[4]) + 50)
-
-        fn = normalize(from_addr)
-        tn = normalize(to_addr)
-
-        now = datetime.now()
-        is_night = now.hour < 6 or (now.hour == 6 and now.minute < 30)
-
-        if (fn, tn) in prices:
-            d, n = prices[(fn, tn)]
-            price = n if is_night else d
-            night = " (ночной тариф 🌙)" if is_night else ""
-            return f"💰 Предварительная стоимость: {price} руб.{night}\nТочную стоимость укажет водитель."
-
-        for (f, t), (d, n) in prices.items():
-            if (fn in f or f in fn) and (tn in t or t in tn):
-                price = n if is_night else d
-                night = " (ночной тариф 🌙)" if is_night else ""
-                return f"💰 Предварительная стоимость: {price} руб.{night}\nТочную стоимость укажет водитель."
-
-    except Exception as e:
-        logger.error(f"Ошибка прайса: {e}")
-
-    return "💰 Предварительная стоимость: от 150 руб.\nТочную стоимость укажет водитель."
+async def notify_no_driver(session, order_id, user_id):
+    await asyncio.sleep(300)
+    if order_id not in max_orders:
+        return
+    if max_orders[order_id]["status"] != "new":
+        return
+    await send_max(session, user_id,
+        "⚠️ Пока никто не взял ваш заказ.\n\n"
+        "Напишите /start чтобы попробовать снова.\n"
+        "Приносим извинения! 🙏"
+    )
 
 
 # ─── ОБРАБОТКА СООБЩЕНИЙ ─────────────────────
 
-async def handle_message(session, message):
+async def handle_update(session, update):
     global max_order_counter
 
-    user_id = message.get("sender", {}).get("user_id")
-    text = message.get("body", {}).get("text", "").strip()
+    update_type = update.get("update_type")
+    logger.info(f"Получено обновление: {update_type}")
 
-    if not user_id or not text:
+    # Получаем сообщение
+    if update_type == "message_created":
+        message = update.get("message", {})
+    elif update_type == "bot_started":
+        message = update.get("message", {})
+    else:
         return
 
-    # Команда /start
-    if text.lower() in ["/start", "start"]:
-        max_active_chats.pop(user_id, None)
-        await send_max_message(session, user_id,
+    sender = message.get("sender", {})
+    user_id = sender.get("user_id")
+    body = message.get("body", {})
+    text = body.get("text", "").strip() if body else ""
+
+    if not user_id:
+        return
+
+    logger.info(f"Сообщение от {user_id}: {text}")
+
+    state = max_states.get(user_id, {})
+
+    # /start или bot_started
+    if text.lower() in ["/start", "start", "привет"] or update_type == "bot_started":
+        max_states[user_id] = {"step": "waiting_from"}
+        await send_max(session, user_id,
             "🚕 Добро пожаловать в службу такси!\n\n"
             "Введите адрес ОТКУДА вас забрать:"
         )
-        max_active_chats[user_id] = {"step": "waiting_from"}
         return
 
     # Шаг 1 — откуда
-    if user_id in max_active_chats and max_active_chats[user_id].get("step") == "waiting_from":
-        max_active_chats[user_id] = {"step": "waiting_to", "from": text}
-        await send_max_message(session, user_id,
-            f"📍 Откуда: {text}\n\nТеперь введите адрес КУДА вас везти:"
+    if state.get("step") == "waiting_from":
+        max_states[user_id] = {"step": "waiting_to", "from": text}
+        await send_max(session, user_id,
+            f"📍 Откуда: {text}\n\n"
+            f"Теперь введите адрес КУДА вас везти:"
         )
         return
 
     # Шаг 2 — куда
-    if user_id in max_active_chats and max_active_chats[user_id].get("step") == "waiting_to":
-        from_addr = max_active_chats[user_id]["from"]
+    if state.get("step") == "waiting_to":
+        from_addr = state["from"]
         to_addr = text
 
         max_order_counter += 1
-        order_id = f"M{max_order_counter}"  # M = из Макса
+        order_id = f"M{max_order_counter}"
 
         max_orders[order_id] = {
             "client_id": user_id,
             "from_addr": from_addr,
             "to_addr": to_addr,
-            "driver_id": None,
+            "driver_tg_id": None,
             "status": "new",
-            "source": "max",
             "date": datetime.now().strftime("%d.%m.%Y %H:%M")
         }
-        max_active_chats[user_id] = {"step": "active", "order_id": order_id}
+        max_states[user_id] = {"step": "active", "order_id": order_id}
 
-        price_text = get_price_max(from_addr, to_addr)
+        price_text = get_price(from_addr, to_addr)
 
-        await send_max_message(session, user_id,
+        await send_max(session, user_id,
             f"✅ Ваш заказ принят!\n\n"
             f"📍 Откуда: {from_addr}\n"
             f"🏁 Куда: {to_addr}\n\n"
@@ -163,89 +194,83 @@ async def handle_message(session, message):
             f"⏳ Ищем водителя, ожидайте..."
         )
 
-        # Отправляем заказ в чат водителей Telegram
+        # Отправляем в чат водителей Telegram
         keyboard = {
             "inline_keyboard": [[
-                {"text": f"✅ Взять заказ (MAX)", "callback_data": f"takemax_{order_id}_{user_id}_{from_addr[:20]}_{to_addr[:20]}"}
+                {"text": "✅ Взять заказ (MAX)", "callback_data": f"takemax_{order_id}"}
             ]]
         }
-        await send_tg_message(
-            session,
-            DRIVERS_CHAT_ID,
+        await send_tg(session, DRIVERS_CHAT_ID,
             f"🚖 *НОВЫЙ ЗАКАЗ {order_id}* (из Макса 📱)\n\n"
             f"📍 Откуда: {from_addr}\n"
             f"🏁 Куда: {to_addr}\n",
-            reply_markup=keyboard
+            keyboard=keyboard
         )
 
-        # Таймер 5 минут
-        asyncio.create_task(notify_no_driver_max(session, order_id, user_id))
+        asyncio.create_task(notify_no_driver(session, order_id, user_id))
         return
 
-    # Переписка с водителем
-    if user_id in max_active_chats and max_active_chats[user_id].get("step") == "active":
-        order_id = max_active_chats[user_id].get("order_id")
+    # Переписка клиента с водителем
+    if state.get("step") == "active":
+        order_id = state.get("order_id")
         if order_id and order_id in max_orders:
             order = max_orders[order_id]
             if order.get("driver_tg_id"):
-                # Отправляем сообщение водителю в Telegram
-                await send_tg_message(
-                    session,
-                    order["driver_tg_id"],
+                await send_tg(session, order["driver_tg_id"],
                     f"💬 *Сообщение от клиента (MAX):*\n{text}"
                 )
             else:
-                await send_max_message(session, user_id, "⏳ Ожидайте, водитель ещё не найден...")
+                await send_max(session, user_id, "⏳ Ожидайте, водитель ещё не найден...")
         return
 
     # Если ничего не подошло
-    await send_max_message(session, user_id,
+    await send_max(session, user_id,
         "Напишите /start чтобы заказать такси 🚕"
     )
 
 
-# ─── УВЕДОМЛЕНИЕ ЕСЛИ НЕ ВЗЯЛИ 5 МИНУТ ──────
-
-async def notify_no_driver_max(session, order_id, user_id):
-    await asyncio.sleep(300)
-    if order_id not in max_orders:
-        return
-    if max_orders[order_id]["status"] != "new":
-        return
-    await send_max_message(session, user_id,
-        "⚠️ Пока никто не взял ваш заказ.\n\n"
-        "Попробуйте написать /start и сделать новый заказ.\n"
-        "Приносим извинения за ожидание! 🙏"
-    )
-
-
-# ─── ОСНОВНОЙ ЦИКЛ — POLLING ─────────────────
+# ─── ОСНОВНОЙ ЦИКЛ ───────────────────────────
 
 async def polling():
     global max_marker
-    headers = {"Authorization": MAX_TOKEN}
+    params_base = {"access_token": MAX_TOKEN}
 
     async with aiohttp.ClientSession() as session:
-        logger.info("MAX бот запущен!")
+        logger.info("MAX бот запущен! Начинаем polling...")
+
+        # Проверяем подключение
+        try:
+            async with session.get(f"{MAX_API}/me", params=params_base) as r:
+                me = await r.json()
+                logger.info(f"Бот подключён: {me}")
+        except Exception as e:
+            logger.error(f"Ошибка подключения к MAX API: {e}")
 
         while True:
             try:
-                params = {"timeout": 30}
+                params = {**params_base, "timeout": 20, "limit": 100}
                 if max_marker:
                     params["marker"] = max_marker
 
-                url = f"{MAX_API}/updates"
-                async with session.get(url, headers=headers, params=params) as r:
+                async with session.get(
+                    f"{MAX_API}/updates",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as r:
                     data = await r.json()
 
-                updates = data.get("updates", [])
-                if data.get("marker"):
+                if "marker" in data:
                     max_marker = data["marker"]
 
+                updates = data.get("updates", [])
                 for update in updates:
-                    if update.get("update_type") == "message_created":
-                        await handle_message(session, update.get("message", {}))
+                    try:
+                        await handle_update(session, update)
+                    except Exception as e:
+                        logger.error(f"Ошибка обработки: {e}")
 
+            except asyncio.TimeoutError:
+                pass
             except Exception as e:
                 logger.error(f"Ошибка polling: {e}")
                 await asyncio.sleep(5)
