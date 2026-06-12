@@ -7,12 +7,20 @@ from openpyxl import load_workbook
 import re
 
 # Настройки
-MAX_TOKEN = os.getenv("MAX_TOKEN", "f9LHodD0cOIaJNGoUYKSYuCQvJBYTkPKvf-Apng6RHg-XRcfRq78dAdalAzv2A0LlofhyQSq3OcESloHr9O_")
-TG_BOT_TOKEN = os.getenv("BOT_TOKEN", "8619478031:AAGf1mmtJQgtEGJ9m05hDW16ok7eDD-qijQ")
-DRIVERS_CHAT_ID = int(os.getenv("DRIVERS_CHAT_ID", "-1003935717475"))
+# Читаем токены
+MAX_TOKEN = os.getenv("MAX_TOKEN", "")
+TG_BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+DRIVERS_CHAT_ID = int(os.getenv("DRIVERS_CHAT_ID", "0"))
 
 MAX_API = "https://platform-api.max.ru"
 TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
+
+# Логируем что загрузилось
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+logger.info(f"MAX_TOKEN: '{MAX_TOKEN[:15]}...' (длина: {len(MAX_TOKEN)})")
+logger.info(f"BOT_TOKEN: '{TG_BOT_TOKEN[:10]}...'")
+logger.info(f"DRIVERS_CHAT_ID: {DRIVERS_CHAT_ID}")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -77,7 +85,7 @@ def get_price(from_addr, to_addr):
 
 async def send_max(session, user_id, text):
     url = f"{MAX_API}/messages"
-    headers = {"Authorization": f"Bearer {MAX_TOKEN}"}
+    headers = {"Authorization": MAX_TOKEN}
     payload = {
         "recipient": {"user_id": user_id},
         "body": {"text": text}
@@ -233,18 +241,33 @@ async def handle_update(session, update):
 
 async def polling():
     global max_marker
-    headers = {"Authorization": f"Bearer {MAX_TOKEN}"}
+
+    token = os.getenv("MAX_TOKEN", "NOT_FOUND")
+    logger.info(f"Токен из env: длина={len(token)}, начало={token[:10]}")
+
+    # Пробуем разные форматы авторизации
+    headers_variants = [
+        {"Authorization": token},
+        {"Authorization": f"Bearer {token}"},
+        {"access-token": token},
+    ]
 
     async with aiohttp.ClientSession() as session:
         logger.info("MAX бот запущен! Начинаем polling...")
 
-        # Проверяем подключение
-        try:
-            async with session.get(f"{MAX_API}/me", headers=headers) as r:
-                me = await r.json()
-                logger.info(f"Бот подключён: {me}")
-        except Exception as e:
-            logger.error(f"Ошибка подключения к MAX API: {e}")
+        # Проверяем подключение всеми способами
+        for headers in headers_variants:
+            try:
+                async with session.get(f"{MAX_API}/me", headers=headers) as r:
+                    me = await r.json()
+                    logger.info(f"Попытка с {list(headers.keys())[0]}: {me}")
+                    if me.get("user_id") or me.get("name"):
+                        logger.info(f"✅ Успешно! Используем: {list(headers.keys())[0]}")
+                        break
+            except Exception as e:
+                logger.error(f"Ошибка: {e}")
+
+        headers = {"Authorization": token}
 
         while True:
             try:
